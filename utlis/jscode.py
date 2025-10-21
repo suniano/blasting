@@ -46,41 +46,137 @@ JS_CANVAS_TEMPLATE = """
 """
 
 JS_LOGIN_TEMPLATE = """
-() => {
-    const urls = [];
-    const forms = document.getElementsByTagName('input');
-    
-    for (let i = 0; i < forms.length; i++) {
-        if (forms[i].type === 'password') {
-            // 设置密码
-            forms[i].setAttribute("value", '%s');
-            forms[i].dispatchEvent(new Event('change', { bubbles: true }));
-            forms[i].dispatchEvent(new Event('input', { bubbles: true }));
+({ password, username }) => {
+    const result = { status: false, message: '', attempted: false };
 
-            // 设置用户名
-            const prevIndex = i - 1;
-            forms[prevIndex].setAttribute("value", '%s');
-            forms[prevIndex].dispatchEvent(new Event('change', { bubbles: true }));
-            forms[prevIndex].dispatchEvent(new Event('input', { bubbles: true }));
-        } else if (['submit', 'image', 'button'].includes(forms[i].type)) {
-            if (forms[i].style.display !== 'none') {
-                forms[i].dispatchEvent(new CustomEvent('input'));
-                forms[i].click();
-                urls.push('isok');
+    const isVisible = (element) => !!(element && element.offsetParent !== null);
+    const fillInput = (input, value) => {
+        if (!input) return;
+        input.focus();
+        input.value = value;
+        input.setAttribute('value', value);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+
+    const toggleCheckboxes = () => {
+        const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+        checkboxes.forEach((checkbox) => {
+            if (checkbox.disabled) return;
+            checkbox.checked = true;
+            checkbox.dispatchEvent(new Event('click', { bubbles: true }));
+        });
+    };
+
+    toggleCheckboxes();
+
+    const passwordFields = Array.from(document.querySelectorAll('input[type="password"]'));
+    const candidateSelector = 'input[type="text"], input[type="email"], input[type="tel"], input:not([type])';
+    const userKeywords = ['user', 'account', 'name', 'email', 'phone', 'mail', '登录', '登陆', '帳號', '账号', '邮箱', '手机'];
+    const buttonKeywords = ['login', 'sign in', 'signin', 'submit', 'enter', '确认', '登录', '登陆', '提交', '继续', '下一步'];
+
+    const collectButtons = (root) => {
+        const selectors = ['input[type="submit"]', 'input[type="button"]', 'button', 'a.button', 'a.btn', 'a.login'];
+        return selectors.reduce((acc, selector) => {
+            const elements = Array.from((root || document).querySelectorAll(selector));
+            return acc.concat(elements);
+        }, []);
+    };
+
+    for (const pwd of passwordFields) {
+        if (!isVisible(pwd) || pwd.disabled || pwd.readOnly) {
+            continue;
+        }
+
+        let userField = null;
+        const form = pwd.form;
+        const filterCandidate = (input) => {
+            if (!input || input === pwd || !isVisible(input) || input.disabled || input.readOnly) {
+                return false;
+            }
+            const attrs = [input.name, input.id, input.placeholder, input.getAttribute('aria-label')]
+                .filter(Boolean)
+                .join(' ')
+                .toLowerCase();
+            return userKeywords.some((kw) => attrs.includes(kw));
+        };
+
+        if (form) {
+            const candidates = Array.from(form.querySelectorAll(candidateSelector));
+            userField = candidates.find(filterCandidate) || candidates.find((input) => input !== pwd && isVisible(input));
+        }
+
+        if (!userField) {
+            const candidates = Array.from(document.querySelectorAll(candidateSelector));
+            userField = candidates.find(filterCandidate);
+        }
+
+        if (!userField) {
+            continue;
+        }
+
+        fillInput(userField, username || '');
+        fillInput(pwd, password || '');
+        result.attempted = true;
+
+        let submitButton = null;
+        if (form) {
+            submitButton = collectButtons(form).find((element) => {
+                const text = (element.innerText || element.value || '').toLowerCase();
+                return buttonKeywords.some((kw) => text.includes(kw));
+            });
+
+            if (!submitButton && typeof form.submit === 'function') {
+                form.submit();
+                result.status = true;
+                result.message = '使用 form.submit() 提交';
+                return result;
             }
         }
-    }
 
-    // 尝试使用 button 提交
-    if (urls.length === 0) {
-        const buttonForm = document.getElementsByTagName('button');
-        if (buttonForm.length > 0) {
-            buttonForm[0].click();
-            urls.push('isok');
+        if (!submitButton) {
+            submitButton = collectButtons(document).find((element) => {
+                const text = (element.innerText || element.value || '').toLowerCase();
+                return buttonKeywords.some((kw) => text.includes(kw));
+            });
         }
+
+        if (!submitButton) {
+            const candidateForm = Array.from(document.forms || []).find((formElement) => formElement.contains(pwd));
+            if (candidateForm && typeof candidateForm.submit === 'function') {
+                candidateForm.submit();
+                result.status = true;
+                result.message = '使用祖先 form 提交';
+                return result;
+            }
+        }
+
+        if (submitButton && submitButton.click) {
+            submitButton.dispatchEvent(new Event('mousedown', { bubbles: true }));
+            submitButton.dispatchEvent(new Event('mouseup', { bubbles: true }));
+            submitButton.dispatchEvent(new Event('click', { bubbles: true }));
+            result.status = true;
+            result.message = '检测到登录按钮并尝试提交';
+        } else if (submitButton && typeof submitButton.submit === 'function') {
+            submitButton.submit();
+            result.status = true;
+            result.message = '调用 submit 方法提交';
+        } else {
+            pwd.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+            pwd.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+            result.message = '尝试通过回车提交';
+        }
+
+        return result;
     }
 
-    return urls;
+    if (!result.attempted) {
+        result.message = '未找到可用的密码输入框';
+    } else if (!result.status) {
+        result.message = '未能定位到登录按钮';
+    }
+
+    return result;
 }
 """
 
@@ -142,19 +238,22 @@ async def performjs_code(page_two: Any, yzm: str) -> Optional[str]:
         print(f"验证码处理失败: {e}")
         return None
 
-async def performjs(page_two, passwd: str, user: str) -> List[str]:
+async def performjs(page_two, passwd: str, user: str) -> Dict[str, Any]:
     """
     执行登录表单填充和提交
-    
+
     Args:
         page_two: 页面对象
         passwd: 密码
         user: 用户名
-    
+
     Returns:
-        List[str]: 提交状态列表
+        Dict[str, Any]: 提交状态和日志
     """
-    return await page_two.evaluate(JS_LOGIN_TEMPLATE % (passwd, user))
+    return await page_two.evaluate(JS_LOGIN_TEMPLATE, {
+        'password': passwd,
+        'username': user
+    })
 
 async def performjs_yzm_code(page_two, passwd, user, code):
     """
