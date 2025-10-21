@@ -37,6 +37,7 @@ class Ui(object):
         self.captcha_retry_list = []
         self.ocr = DdddOcr(show_ad=False)
         self.task_list = []
+        self.batch_targets = []
         self.credentials = {
             'username': '',
             'password': ''
@@ -361,9 +362,15 @@ class Ui(object):
 
     # -------- 爆破模式处理函数 --------
     def blastingmode(self, mode: str):
-        url = self.target_url.text()
-        user = self.password_result_text_user.toPlainText().split('\n')
-        password = self.password_result_text_pass.toPlainText().split('\n')
+        url = self.target_url.text().strip()
+        user = [u.strip() for u in self.password_result_text_user.toPlainText().split('\n') if u.strip()]
+        password = [p.strip() for p in self.password_result_text_pass.toPlainText().split('\n') if p.strip()]
+        for record in self.get_batch_entries():
+            self.url_queue.add(record)
+        if not url:
+            if not self.url_queue:
+                self.print_log('请设置目标地址或批量目标')
+            return
         if url.endswith(".txt"):
             data = read_url_list(url)
             for urls in data:
@@ -625,6 +632,60 @@ class Ui(object):
         datalist = get_common_credentials(self.cdp_mode_listpass.currentText())
         for key in datalist:
             self.password_result_text_pass.appendPlainText(str(key))
+
+    def load_batch_targets(self):
+        open_file_name = QFileDialog.getOpenFileName()
+        file_path = open_file_name[0]
+        if not file_path:
+            return
+        try:
+            text = Path(file_path).read_text(encoding="utf-8", errors='ignore')
+            self.batch_result_text.setPlainText(text)
+            self.batch_targets = self._parse_batch_text(text)
+            self.print_log(f"批量目标加载 {len(self.batch_targets)} 条记录")
+        except Exception as e:
+            logger.error(f"批量目标加载失败: {e}")
+            self.announcement.append(f"批量目标加载失败: {e}")
+
+    def paste_batch_targets(self):
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        if not text:
+            return
+        self.batch_result_text.appendPlainText(text)
+        self.batch_targets = self._parse_batch_text(self.batch_result_text.toPlainText())
+
+    def clear_batch_targets(self):
+        self.batch_result_text.clear()
+        self.batch_targets = []
+        self.print_log("批量目标已清空")
+
+    def _parse_batch_text(self, text: str):
+        entries = []
+        seen = set()
+        for line_no, raw_line in enumerate(text.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = [p for p in re.split(r'[\s,|]+', line) if p]
+            if len(parts) < 3:
+                logger.warning(f"批量目标第{line_no}行格式不正确: {raw_line}")
+                self.announcement.append(f"批量目标第{line_no}行格式不正确: {raw_line}")
+                continue
+            url, username, password = parts[:3]
+            if not url.startswith(("http://", "https://")):
+                url = f"http://{url}"
+            record = (url, username, password)
+            if record in seen:
+                continue
+            seen.add(record)
+            entries.append(record)
+        return entries
+
+    def get_batch_entries(self):
+        if self.batch_result_text.toPlainText().strip():
+            self.batch_targets = self._parse_batch_text(self.batch_result_text.toPlainText())
+        return list(self.batch_targets)
 
     # -------- UI设置函数 --------
     def setupui(self, mainwindow):
@@ -914,6 +975,26 @@ class Ui(object):
         self.cdp_mode_listpass.setGeometry(QtCore.QRect(120, 200, 320, 30))
         self.cdp_mode_listpass.setObjectName("cdp_mode_listpass")
         self.tabWidget_user_passwd.addTab(self.tab_pass, "")
+        self.tab_batch = QtWidgets.QWidget()
+        self.tab_batch.setObjectName("tab_batch")
+        self.Batch_Paste_button = QtWidgets.QPushButton(self.tab_batch)
+        self.Batch_Paste_button.setGeometry(QtCore.QRect(10, 20, 80, 30))
+        self.Batch_Paste_button.setObjectName("Batch_Paste_button")
+        self.Batch_Load_button = QtWidgets.QPushButton(self.tab_batch)
+        self.Batch_Load_button.setGeometry(QtCore.QRect(10, 70, 80, 30))
+        self.Batch_Load_button.setObjectName("Batch_Load_button")
+        self.Batch_Clear_button = QtWidgets.QPushButton(self.tab_batch)
+        self.Batch_Clear_button.setGeometry(QtCore.QRect(10, 120, 80, 30))
+        self.Batch_Clear_button.setObjectName("Batch_Clear_button")
+        self.batch_result_text = QtWidgets.QPlainTextEdit(self.tab_batch)
+        self.batch_result_text.setGeometry(QtCore.QRect(120, 10, 320, 160))
+        self.batch_result_text.setObjectName("batch_result_text")
+        self.batch_result_text.setPlaceholderText("http://example.com admin password")
+        self.batch_format_label = QtWidgets.QLabel(self.tab_batch)
+        self.batch_format_label.setGeometry(QtCore.QRect(120, 180, 320, 50))
+        self.batch_format_label.setWordWrap(True)
+        self.batch_format_label.setObjectName("batch_format_label")
+        self.tabWidget_user_passwd.addTab(self.tab_batch, "")
         mainwindow.setCentralWidget(self.centralwidget)
         self.retranslateui(mainwindow)
         self.tabWidget_user_passwd.setCurrentIndex(0)
@@ -1006,6 +1087,12 @@ class Ui(object):
         self.cdp_mode_listpass.addItem(_translate("MainWindow", "密码数字_1-100"))
         self.tabWidget_user_passwd.setTabText(self.tabWidget_user_passwd.indexOf(self.tab_pass),
                                               _translate("MainWindow", "密码"))
+        self.Batch_Paste_button.setText(_translate("MainWindow", "Paste"))
+        self.Batch_Load_button.setText(_translate("MainWindow", "Load"))
+        self.Batch_Clear_button.setText(_translate("MainWindow", "Clear"))
+        self.batch_format_label.setText(_translate("MainWindow", "每行格式: URL 用户名 密码 (支持空格、逗号或|分隔)"))
+        self.tabWidget_user_passwd.setTabText(self.tabWidget_user_passwd.indexOf(self.tab_batch),
+                                              _translate("MainWindow", "批量目标"))
 
     def ui_set(self, mainwindow, loop):
         self.setupui(mainwindow)
@@ -1030,6 +1117,10 @@ class Ui(object):
         self.add_text_button_pass.clicked.connect(lambda: self.add_button())
         self.Clear_list_button_pass.clicked.connect(lambda: self.clear_button_pass())
         self.Load_file_button_pass.clicked.connect(lambda: self.load_button_pass())
+        # 批量目标
+        self.Batch_Paste_button.clicked.connect(lambda: self.paste_batch_targets())
+        self.Batch_Load_button.clicked.connect(lambda: self.load_batch_targets())
+        self.Batch_Clear_button.clicked.connect(lambda: self.clear_batch_targets())
 
         # cdp 模块
         self.cdp_start.clicked.connect(lambda: self.start_cdp_button(loop))
