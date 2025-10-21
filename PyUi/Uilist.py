@@ -1195,4 +1195,4 @@ class Ui(object):
         self.cdp_mode_listpass.currentIndexChanged.connect(lambda: self.add_buttondictionary_pass())
 
 
-        settings = Ui()
+settings = Ui()
